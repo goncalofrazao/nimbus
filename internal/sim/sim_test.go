@@ -48,6 +48,33 @@ func TestPerWorkloadSLOAccounting(t *testing.T) {
 	}
 }
 
+// TestSeasonalCutsRecurringSpikeViolations: an *instant* flash sale at the
+// same time every day is invisible to trend extrapolation — plain Holt burns
+// on it daily, while Holt-Winters pre-provisions from day 2 on. So over a
+// 3-day replay HW must beat plain Holt on SLO without costing more.
+func TestSeasonalCutsRecurringSpikeViolations(t *testing.T) {
+	trace := make([]float64, 3*Day)
+	for t := range trace {
+		trace[t] = 100
+		if d := t % Day; d >= 600 && d < 630 {
+			trace[t] += 300 // flash sale, zero ramp, daily
+		}
+	}
+	ws := []Workload{{Name: "web", CPU: 500, Mem: 512, RPSPerReplica: 10, Trace: trace}}
+
+	holt := Run("holt", scheduler.BinPack{}, autoscaler.PredictiveFactory, ws)
+	hw := Run("hw", scheduler.BinPack{}, autoscaler.SeasonalPredictiveFactory(Day), ws)
+
+	if hw.SLOViolationTicks() >= holt.SLOViolationTicks() {
+		t.Errorf("holt-winters should cut SLO violations: %d vs %d",
+			hw.SLOViolationTicks(), holt.SLOViolationTicks())
+	}
+	if hw.NodeHours() > 1.10*holt.NodeHours() {
+		t.Errorf("seasonality should not cost >10%% more: %.1f vs %.1f node-hours",
+			hw.NodeHours(), holt.NodeHours())
+	}
+}
+
 func TestCapacityNeverNegativeAndNodesBounded(t *testing.T) {
 	ws := Workloads(720, 42)
 	m := Run("nimbus", scheduler.BinPack{}, autoscaler.PredictiveFactory, ws)

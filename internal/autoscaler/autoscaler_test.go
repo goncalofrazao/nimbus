@@ -42,6 +42,47 @@ func TestFallingTrendIsDamped(t *testing.T) {
 	}
 }
 
+// TestSeasonalAnticipatesRecurringSpike: a spike at the same time every
+// "day" surprises plain Holt forever, but Holt-Winters sees it coming from
+// the second day on.
+func TestSeasonalAnticipatesRecurringSpike(t *testing.T) {
+	const day, spikeAt, spikeLen = 100, 60, 8
+	demand := func(tick int) float64 {
+		if i := tick % day; i >= spikeAt && i < spikeAt+spikeLen {
+			return 400
+		}
+		return 100
+	}
+
+	hw := NewSeasonalPredictive(10, day)
+	holt := NewPredictive(10)
+	// Observe two full days plus the run-up to day 3's spike, stopping
+	// Lead ticks before it starts: a forecast made here is what decides
+	// whether capacity boots in time.
+	for tick := 0; tick <= 2*day+spikeAt-hw.Lead; tick++ {
+		hw.Observe(demand(tick))
+		holt.Observe(demand(tick))
+	}
+	if f := hw.Forecast(hw.Lead); f < 200 {
+		t.Errorf("holt-winters should anticipate the day-3 spike: forecast=%.1f want ≥200", f)
+	}
+	if f := holt.Forecast(holt.Lead); f > 150 {
+		t.Errorf("plain holt should NOT see the spike coming: forecast=%.1f want ≤150", f)
+	}
+}
+
+// TestSeasonalWarmup: before one full period is observed, the seasonal
+// component must stay silent (no garbage forecasts).
+func TestSeasonalWarmup(t *testing.T) {
+	hw := NewSeasonalPredictive(10, 100)
+	for i := 0; i < 50; i++ {
+		hw.Observe(200)
+	}
+	if f := hw.Forecast(5); math.Abs(f-200) > 10 {
+		t.Errorf("mid-warmup forecast on flat demand: %.1f want ≈200", f)
+	}
+}
+
 func TestDesiredNeverBelowOne(t *testing.T) {
 	p := NewPredictive(10)
 	p.Observe(0)

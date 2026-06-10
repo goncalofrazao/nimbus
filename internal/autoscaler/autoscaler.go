@@ -68,15 +68,22 @@ func (r *Reactive) Desired(tick int, demandNow float64, current int) int {
 
 // ---------------------------------------------------------------------------
 
-// Predictive is the Nimbus autoscaler (Holt's linear smoothing).
+// Predictive is the Nimbus autoscaler: Holt's linear smoothing, upgraded to
+// additive Holt-Winters when Period > 0 — recurring patterns (the daily
+// flash sale, the morning ramp) are anticipated after one sighting instead
+// of burning the cluster every time.
 type Predictive struct {
 	RPSPerReplica float64
 	Lead          int     // forecast horizon ≥ node boot time
 	TargetUtil    float64 // trend-aware ⇒ can run pods hotter
 	Alpha, Beta   float64
+	Period        int     // seasonal period in ticks; 0 disables seasonality
+	Gamma         float64 // seasonal smoothing factor
 
 	level       float64
 	trend       float64
+	seasonal    []float64 // additive seasonal index per tick-of-period
+	seen        int       // observations so far; gates seasonal warm-up
 	initialized bool
 }
 
@@ -90,21 +97,59 @@ func NewPredictive(rpsPerReplica float64) *Predictive {
 	}
 }
 
-func (p *Predictive) Name() string { return "predictive (nimbus)" }
+// NewSeasonalPredictive enables the additive Holt-Winters seasonal
+// component with the given period (in ticks). Until one full period has
+// been observed it behaves exactly like plain Holt.
+func NewSeasonalPredictive(rpsPerReplica float64, period int) *Predictive {
+	p := NewPredictive(rpsPerReplica)
+	p.Period = period
+	p.Gamma = 0.5
+	p.seasonal = make([]float64, period)
+	return p
+}
 
-// Observe runs the Holt double-exponential smoothing update.
+// SeasonalPredictiveFactory returns a sim.Run factory with the seasonal
+// period baked in.
+func SeasonalPredictiveFactory(period int) func(rpsPerReplica float64) Autoscaler {
+	return func(rpsPerReplica float64) Autoscaler {
+		return NewSeasonalPredictive(rpsPerReplica, period)
+	}
+}
+
+func (p *Predictive) Name() string {
+	if p.Period > 0 {
+		return "predictive (nimbus, holt-winters)"
+	}
+	return "predictive (nimbus)"
+}
+
+// Observe runs the Holt double-exponential smoothing update, plus the
+// Holt-Winters seasonal update when a period is configured. Observation t
+// belongs to seasonal slot t mod Period.
 func (p *Predictive) Observe(demand float64) {
 	if !p.initialized {
 		p.level, p.initialized = demand, true
+		p.seen = 1
 		return
 	}
+	s := 0.0
+	idx := 0
+	if p.Period > 0 {
+		idx = p.seen % p.Period
+		s = p.seasonal[idx]
+	}
 	prev := p.level
-	p.level = p.Alpha*demand + (1-p.Alpha)*(p.level+p.trend)
+	p.level = p.Alpha*(demand-s) + (1-p.Alpha)*(p.level+p.trend)
 	p.trend = p.Beta*(p.level-prev) + (1-p.Beta)*p.trend
+	if p.Period > 0 {
+		p.seasonal[idx] = p.Gamma*(demand-p.level) + (1-p.Gamma)*s
+	}
+	p.seen++
 }
 
 // Forecast projects demand k ticks ahead. Falling trends are damped so we
-// don't underscale on noise.
+// don't underscale on noise. The seasonal index only contributes once a
+// full period has been observed.
 func (p *Predictive) Forecast(k int) float64 {
 	if !p.initialized {
 		return 0
@@ -114,6 +159,9 @@ func (p *Predictive) Forecast(k int) float64 {
 		t *= 0.3
 	}
 	f := p.level + float64(k)*t
+	if p.Period > 0 && p.seen >= p.Period {
+		f += p.seasonal[(p.seen-1+k)%p.Period]
+	}
 	if f < 0 {
 		return 0
 	}

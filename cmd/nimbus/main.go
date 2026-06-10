@@ -38,14 +38,20 @@ func summarize(m *sim.Metrics) summary {
 func main() {
 	ticks := flag.Int("ticks", 720, "minutes to simulate")
 	seed := flag.Int64("seed", 42, "traffic noise seed")
+	period := flag.Int("period", 0,
+		"Holt-Winters seasonal period in minutes (0 = off; try 1440 with -ticks 4320)")
 	svgPath := flag.String("svg", "", "write SVG chart to this path")
 	jsonPath := flag.String("json", "", "write results JSON to this path")
 	flag.Parse()
 
 	ws := sim.Workloads(*ticks, *seed)
 
+	nimAS := autoscaler.PredictiveFactory
+	if *period > 0 {
+		nimAS = autoscaler.SeasonalPredictiveFactory(*period)
+	}
 	k8s := sim.Run("k8s-style", scheduler.Spread{}, autoscaler.ReactiveFactory, ws)
-	nim := sim.Run("nimbus", scheduler.BinPack{}, autoscaler.PredictiveFactory, ws)
+	nim := sim.Run("nimbus", scheduler.BinPack{}, nimAS, ws)
 
 	ks, ns := summarize(k8s), summarize(nim)
 
