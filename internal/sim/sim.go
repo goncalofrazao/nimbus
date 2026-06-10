@@ -43,16 +43,20 @@ type spike struct {
 	height     float64
 }
 
+// Day is the seasonal period: spikes recur at the same wall-clock offset
+// every Day ticks — the recurring flash sale Holt-Winters learns to expect.
+const Day = 1440
+
 // synthTrace builds a demand curve in rps: diurnal ramp (phase-shifted per
-// tenant), sharp flash-sale spikes, and gaussian noise.
+// tenant), sharp daily-recurring flash-sale spikes, and gaussian noise.
 func synthTrace(ticks int, seed int64, base, amp, phase float64, spikes ...spike) []float64 {
 	rng := rand.New(rand.NewSource(seed))
 	out := make([]float64, ticks)
 	for t := 0; t < ticks; t++ {
 		v := base + amp*math.Sin(math.Pi*float64(t)/float64(ticks)+phase)
 		for _, s := range spikes {
-			if t >= s.start && t < s.start+s.dur {
-				v += s.height * math.Min(1, float64(t-s.start)/6) // sharp ramp
+			if d := t % Day; d >= s.start && d < s.start+s.dur {
+				v += s.height * math.Min(1, float64(d-s.start)/6) // sharp ramp
 			}
 		}
 		v += rng.NormFloat64() * base / 15
