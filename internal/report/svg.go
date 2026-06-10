@@ -4,6 +4,7 @@ package report
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strings"
 
@@ -34,9 +35,9 @@ func WriteSVG(path string, k8s, nim *sim.Metrics) error {
 
 	maxRPS := maxOf(k8s.Demand, k8s.Capacity, nim.Capacity)
 	panelSeries(&b, 0, "K8s-style: reactive HPA + spread scheduling",
-		k8s.Demand, k8s.Capacity, colRed, maxRPS)
+		k8s, colRed, maxRPS)
 	panelSeries(&b, 1, "Nimbus: predictive autoscaling + bin-packing",
-		nim.Demand, nim.Capacity, colGreen, maxRPS)
+		nim, colGreen, maxRPS)
 	panelNodes(&b, 2, k8s, nim)
 
 	b.WriteString("</svg>\n")
@@ -44,24 +45,30 @@ func WriteSVG(path string, k8s, nim *sim.Metrics) error {
 }
 
 func panelSeries(b *strings.Builder, idx int, title string,
-	demand, capacity []float64, color string, maxV float64) {
+	m *sim.Metrics, color string, maxV float64) {
 
 	oy := idx * panelH
 	fmt.Fprintf(b, `<text x="%d" y="%d" font-size="14" font-weight="bold">%s</text>`+"\n", padL, oy+20, title)
 	axes(b, oy, maxV, "rps")
 
-	// SLO violation shading: thin red columns where demand > capacity.
-	for i := range demand {
-		if demand[i] > capacity[i] {
-			x := xPos(i, len(demand))
-			y1 := yPos(demand[i], maxV, oy)
-			y2 := yPos(capacity[i], maxV, oy)
-			fmt.Fprintf(b, `<rect x="%.1f" y="%.1f" width="1.6" height="%.1f" fill="%s" opacity="0.35"/>`+"\n",
-				x-0.8, y1, y2-y1, colRed)
+	// SLO violation shading: thin red columns on ticks where any workload
+	// was undersupplied (aggregate capacity can mask per-tenant shortfalls).
+	for i := range m.Demand {
+		if m.Unserved[i] <= 0 {
+			continue
 		}
+		x := xPos(i, len(m.Demand))
+		y1 := yPos(math.Max(m.Demand[i], m.Capacity[i]), maxV, oy)
+		y2 := yPos(math.Min(m.Demand[i], m.Capacity[i]), maxV, oy)
+		h := y2 - y1
+		if h < 2 {
+			h = 2
+		}
+		fmt.Fprintf(b, `<rect x="%.1f" y="%.1f" width="1.6" height="%.1f" fill="%s" opacity="0.35"/>`+"\n",
+			x-0.8, y1, h, colRed)
 	}
-	polyline(b, demand, maxV, oy, colGrey, 1)
-	polyline(b, capacity, maxV, oy, color, 1.6)
+	polyline(b, m.Demand, maxV, oy, colGrey, 1)
+	polyline(b, m.Capacity, maxV, oy, color, 1.6)
 	legend(b, oy, [][2]string{{colGrey, "demand (rps)"}, {color, "capacity"}, {colRed, "SLO violations"}})
 }
 

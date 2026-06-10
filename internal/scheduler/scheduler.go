@@ -46,19 +46,28 @@ func Schedule(s Scheduler, st *cluster.State, tick int) int {
 	return placed
 }
 
-// Victim returns the (node, pod) to remove when replicas scale down.
-func Victim(s Scheduler, st *cluster.State) (*cluster.Node, *cluster.Pod) {
-	var nonEmpty []*cluster.Node
+// Victim returns the (node, pod) to remove when the app scales down.
+// Only nodes hosting at least one pod of the app are candidates.
+func Victim(s Scheduler, st *cluster.State, app string) (*cluster.Node, *cluster.Pod) {
+	var candidates []*cluster.Node
 	for _, n := range st.Nodes {
-		if len(n.Pods) > 0 {
-			nonEmpty = append(nonEmpty, n)
+		for _, p := range n.Pods {
+			if p.App == app {
+				candidates = append(candidates, n)
+				break
+			}
 		}
 	}
-	if len(nonEmpty) == 0 {
+	if len(candidates) == 0 {
 		return nil, nil
 	}
-	n := s.VictimNode(nonEmpty)
-	return n, n.Pods[len(n.Pods)-1]
+	n := s.VictimNode(candidates)
+	for i := len(n.Pods) - 1; i >= 0; i-- {
+		if n.Pods[i].App == app {
+			return n, n.Pods[i]
+		}
+	}
+	return nil, nil
 }
 
 // ---------------------------------------------------------------------------

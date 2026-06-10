@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"math"
 	"testing"
 
 	"github.com/goncalofrazao/nimbus/internal/autoscaler"
@@ -12,9 +13,9 @@ import (
 // cheaper in node-hours than the K8s-style control plane.
 func TestHeadToHead(t *testing.T) {
 	for _, seed := range []int64{1, 7, 42, 99, 2026} {
-		trace := TrafficTrace(720, seed)
-		k8s := Run("k8s", scheduler.Spread{}, autoscaler.NewReactive(RPSPerReplica), trace)
-		nim := Run("nimbus", scheduler.BinPack{}, autoscaler.NewPredictive(RPSPerReplica), trace)
+		ws := Workloads(720, seed)
+		k8s := Run("k8s", scheduler.Spread{}, autoscaler.ReactiveFactory, ws)
+		nim := Run("nimbus", scheduler.BinPack{}, autoscaler.PredictiveFactory, ws)
 
 		if nim.SLOViolationTicks() > k8s.SLOViolationTicks()+3 {
 			t.Errorf("seed %d: nimbus SLO worse: %d vs %d violation ticks",
@@ -31,9 +32,25 @@ func TestHeadToHead(t *testing.T) {
 	}
 }
 
+// TestPerWorkloadSLOAccounting: a starved tenant counts as a violation even
+// when another tenant's overshoot makes the aggregate look healthy.
+func TestPerWorkloadSLOAccounting(t *testing.T) {
+	m := &Metrics{
+		Demand:   []float64{100, 100},
+		Capacity: []float64{100, 120}, // aggregate fine on both ticks
+		Unserved: []float64{0, 30},    // but one tenant short on tick 2
+	}
+	if got := m.SLOViolationTicks(); got != 1 {
+		t.Fatalf("SLOViolationTicks=%d want 1", got)
+	}
+	if got := m.UnservedPct(); math.Abs(got-15) > 1e-9 {
+		t.Fatalf("UnservedPct=%.2f want 15.00", got)
+	}
+}
+
 func TestCapacityNeverNegativeAndNodesBounded(t *testing.T) {
-	trace := TrafficTrace(720, 42)
-	m := Run("nimbus", scheduler.BinPack{}, autoscaler.NewPredictive(RPSPerReplica), trace)
+	ws := Workloads(720, 42)
+	m := Run("nimbus", scheduler.BinPack{}, autoscaler.PredictiveFactory, ws)
 	for i, c := range m.Capacity {
 		if c < 0 {
 			t.Fatalf("tick %d: negative capacity", i)

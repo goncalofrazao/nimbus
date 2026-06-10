@@ -42,16 +42,14 @@ func main() {
 	jsonPath := flag.String("json", "", "write results JSON to this path")
 	flag.Parse()
 
-	trace := sim.TrafficTrace(*ticks, *seed)
+	ws := sim.Workloads(*ticks, *seed)
 
-	k8s := sim.Run("k8s-style", scheduler.Spread{},
-		autoscaler.NewReactive(sim.RPSPerReplica), trace)
-	nim := sim.Run("nimbus", scheduler.BinPack{},
-		autoscaler.NewPredictive(sim.RPSPerReplica), trace)
+	k8s := sim.Run("k8s-style", scheduler.Spread{}, autoscaler.ReactiveFactory, ws)
+	nim := sim.Run("nimbus", scheduler.BinPack{}, autoscaler.PredictiveFactory, ws)
 
 	ks, ns := summarize(k8s), summarize(nim)
 
-	fmt.Println("\n=== 12-hour traffic replay: identical demand, two control planes ===")
+	fmt.Println("\n=== multi-tenant traffic replay: identical demand, two control planes ===")
 	fmt.Println()
 	fmt.Printf("%-12s %22s %22s %12s %26s %12s\n", "control_plane",
 		"slo_violation_minutes", "unserved_traffic_pct", "node_hours",

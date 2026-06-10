@@ -13,10 +13,16 @@ type Pod struct {
 	App string
 }
 
-// NewPod returns a standard web pod (500m CPU, 512Mi).
-func NewPod(app string) *Pod {
-	return &Pod{ID: podSeq.Add(1), CPU: 500, Mem: 512, App: app}
+// NewPod returns a pod of the given shape (millicores / MiB).
+func NewPod(app string, cpu, mem int) *Pod {
+	return &Pod{ID: podSeq.Add(1), CPU: cpu, Mem: mem, App: app}
 }
+
+// Capacity of the standard worker node (millicores / MiB).
+const (
+	NodeCPUCap = 4000
+	NodeMemCap = 8192
+)
 
 // Node is a worker. Nodes take BootDelay ticks to become Ready.
 type Node struct {
@@ -32,7 +38,7 @@ type Node struct {
 // NewNode provisions a standard node (4 cores, 8Gi) at the given tick.
 func NewNode(tick int) *Node {
 	return &Node{
-		ID: nodeSeq.Add(1), CPUCap: 4000, MemCap: 8192,
+		ID: nodeSeq.Add(1), CPUCap: NodeCPUCap, MemCap: NodeMemCap,
 		BootDelay: 5, CreatedAt: tick, EmptySince: -1,
 	}
 }
@@ -114,6 +120,57 @@ func (s *State) AllPods() int {
 		c += len(n.Pods)
 	}
 	return c
+}
+
+// AppPods counts scheduled pods of one app on all nodes, ready or booting.
+func (s *State) AppPods(app string) int {
+	c := 0
+	for _, n := range s.Nodes {
+		for _, p := range n.Pods {
+			if p.App == app {
+				c++
+			}
+		}
+	}
+	return c
+}
+
+// RunningAppPods counts app pods on Ready nodes — only these serve traffic.
+func (s *State) RunningAppPods(tick int, app string) int {
+	c := 0
+	for _, n := range s.Nodes {
+		if !n.Ready(tick) {
+			continue
+		}
+		for _, p := range n.Pods {
+			if p.App == app {
+				c++
+			}
+		}
+	}
+	return c
+}
+
+// PendingOf counts unscheduled pods of one app.
+func (s *State) PendingOf(app string) int {
+	c := 0
+	for _, p := range s.Pending {
+		if p.App == app {
+			c++
+		}
+	}
+	return c
+}
+
+// RemovePending drops the most recently added pending pod of one app.
+func (s *State) RemovePending(app string) bool {
+	for i := len(s.Pending) - 1; i >= 0; i-- {
+		if s.Pending[i].App == app {
+			s.Pending = append(s.Pending[:i], s.Pending[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // RemoveNode deletes node by identity.
