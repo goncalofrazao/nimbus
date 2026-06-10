@@ -21,6 +21,11 @@ type Autoscaler interface {
 	Desired(tick int, demandNow float64, currentReplicas int) int
 }
 
+// ReactiveFactory and PredictiveFactory adapt the constructors to the
+// per-workload factory shape used by sim.Run.
+func ReactiveFactory(rpsPerReplica float64) Autoscaler   { return NewReactive(rpsPerReplica) }
+func PredictiveFactory(rpsPerReplica float64) Autoscaler { return NewPredictive(rpsPerReplica) }
+
 // ---------------------------------------------------------------------------
 
 // Reactive mimics the K8s Horizontal Pod Autoscaler.
