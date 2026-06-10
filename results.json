@@ -1,0 +1,18 @@
+[
+  {
+    "control_plane": "k8s-style",
+    "slo_violation_minutes": 5,
+    "unserved_traffic_pct": 0.17,
+    "node_hours": 162.2,
+    "avg_node_utilization_pct": 36.7,
+    "peak_nodes": 18
+  },
+  {
+    "control_plane": "nimbus",
+    "slo_violation_minutes": 5,
+    "unserved_traffic_pct": 0.17,
+    "node_hours": 73.1,
+    "avg_node_utilization_pct": 79.4,
+    "peak_nodes": 17
+  }
+]

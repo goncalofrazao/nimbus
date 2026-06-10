@@ -1,0 +1,8 @@
+# build artifact
+/nimbus
+
+# OS noise
+.DS_Store
+
+# release archives
+*.zip
