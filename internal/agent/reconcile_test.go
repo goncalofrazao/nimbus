@@ -19,10 +19,24 @@ type fakeRuntime struct {
 	byID   map[string]*runtime.Container
 	pulled []string
 	fails  map[string]error // verb -> error to inject
+	// exitFor maps a container ID to the exit code its exec probe returns;
+	// absent IDs probe healthy (0). execs counts probe invocations.
+	exitFor map[string]int
+	execs   int
 }
 
 func newFake() *fakeRuntime {
-	return &fakeRuntime{byID: map[string]*runtime.Container{}, fails: map[string]error{}}
+	return &fakeRuntime{byID: map[string]*runtime.Container{}, fails: map[string]error{}, exitFor: map[string]int{}}
+}
+
+func (f *fakeRuntime) Exec(_ context.Context, id string, _ []string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fails["exec"]; err != nil {
+		return -1, err
+	}
+	f.execs++
+	return f.exitFor[id], nil
 }
 
 func (f *fakeRuntime) Pull(_ context.Context, image string) error {

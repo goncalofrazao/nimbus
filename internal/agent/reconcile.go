@@ -35,23 +35,32 @@ type Runtime interface {
 	Stop(ctx context.Context, id string, timeout time.Duration) error
 	Remove(ctx context.Context, id string, force bool) error
 	List(ctx context.Context, labels map[string]string) ([]runtime.Container, error)
+	Exec(ctx context.Context, id string, cmd []string) (int, error)
+}
+
+// replicaKey identifies one replica of one workload — the unit the reconciler
+// and the prober both track.
+type replicaKey struct {
+	workload string
+	replica  int
 }
 
 // Reconciler converges one node's containers toward the desired spec.
 type Reconciler struct {
 	rt      Runtime
 	backoff *backoffTable
+	probes  *probeTable
 	now     func() time.Time // injectable clock for deterministic tests
 }
 
 // New returns a Reconciler backed by rt.
 func New(rt Runtime) *Reconciler {
-	return &Reconciler{rt: rt, backoff: newBackoffTable(), now: time.Now}
+	return &Reconciler{rt: rt, backoff: newBackoffTable(), probes: newProbeTable(), now: time.Now}
 }
 
 // Action records one thing the reconciler did (or tried to do) this pass.
 type Action struct {
-	Verb     string // create, restart, remove, backoff, none, error
+	Verb     string // create, restart, remove, backoff, killed, unhealthy, none, error
 	Workload string
 	Replica  int
 	ID       string
@@ -80,11 +89,14 @@ type Report struct {
 	Actions []Action
 }
 
-// Changed reports whether the pass mutated the cluster at all. A converged
-// cluster — and one merely waiting out a backoff — yields Changed()==false.
+// Changed reports whether the pass mutated the cluster at all. No-ops, a
+// backoff wait, and a healthy-but-failing observation (below the kill
+// threshold) are not mutations.
 func (r Report) Changed() bool {
 	for _, a := range r.Actions {
-		if a.Verb != "none" && a.Verb != "backoff" {
+		switch a.Verb {
+		case "none", "backoff", "unhealthy":
+		default:
 			return true
 		}
 	}
@@ -121,11 +133,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, s *spec.Spec) (Report, error
 
 	// Index the world by (workload, replica). Anything managed by Nimbus but
 	// not mappable to a desired replica is an orphan to be reclaimed.
-	type key struct {
-		workload string
-		replica  int
-	}
-	have := make(map[key]runtime.Container, len(actual))
+	have := make(map[replicaKey]runtime.Container, len(actual))
 	var orphans []runtime.Container
 	for _, c := range actual {
 		w := c.Labels[runtime.LabelWorkload]
@@ -134,7 +142,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, s *spec.Spec) (Report, error
 			orphans = append(orphans, c)
 			continue
 		}
-		have[key{w, rep}] = c
+		have[replicaKey{w, rep}] = c
 	}
 
 	desired := make(map[string]spec.Workload, len(s.Workloads))
@@ -144,11 +152,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, s *spec.Spec) (Report, error
 
 	var rep Report
 
+	// 0. Liveness: probe running replicas and kill the unhealthy ones. A
+	//    killed container is marked exited in `have` so the ensure loop below
+	//    restarts it through the normal backoff path.
+	rep.Actions = append(rep.Actions, r.probeAll(ctx, desired, have)...)
+
 	// 1. Ensure every desired replica exists and is running.
 	for _, name := range s.Names() {
 		w := desired[name]
 		for i := 0; i < w.Replicas; i++ {
-			k := key{w.Name, i}
+			k := replicaKey{w.Name, i}
 			cur, ok := have[k]
 			delete(have, k) // consume; whatever remains is excess
 			rep.Actions = append(rep.Actions, r.ensureReplica(ctx, w, i, cur, ok))
@@ -248,7 +261,9 @@ func (r *Reconciler) createReplica(ctx context.Context, w spec.Workload, i int) 
 // removeContainer stops then force-removes a container, returning the action.
 func (r *Reconciler) removeContainer(ctx context.Context, workload string, replica int, c runtime.Container) Action {
 	if replica >= 0 {
-		r.backoff.forget(containerName(workload, replica)) // no longer desired
+		key := containerName(workload, replica) // no longer desired
+		r.backoff.forget(key)
+		r.probes.forget(key)
 	}
 	_ = r.rt.Stop(ctx, c.ID, stopGrace) // best-effort; Remove(force) finishes it
 	if err := r.rt.Remove(ctx, c.ID, true); err != nil {

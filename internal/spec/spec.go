@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Workload is one declared service: an image to run at a target replica count.
@@ -20,6 +21,54 @@ type Workload struct {
 	Replicas int      `json:"replicas"`
 	Cmd      []string `json:"cmd,omitempty"`
 	Env      []string `json:"env,omitempty"`
+	// Liveness, if set, is run periodically inside each replica; a replica
+	// that fails it FailureThreshold times in a row is killed and restarted.
+	Liveness *Probe `json:"liveness,omitempty"`
+}
+
+// Probe is an exec health check: Cmd is run inside the container and the
+// replica is considered healthy iff it exits 0. (Exec probes are namespace-
+// local, so they work without container networking — unlike HTTP/TCP probes.)
+type Probe struct {
+	Exec             []string `json:"exec"`
+	PeriodSeconds    int      `json:"periodSeconds,omitempty"`
+	TimeoutSeconds   int      `json:"timeoutSeconds,omitempty"`
+	FailureThreshold int      `json:"failureThreshold,omitempty"`
+	InitialDelaySec  int      `json:"initialDelaySeconds,omitempty"`
+}
+
+// Probe defaults, applied where the spec leaves a field zero.
+const (
+	defaultPeriodSeconds    = 10
+	defaultTimeoutSeconds   = 2
+	defaultFailureThreshold = 3
+)
+
+// withDefaults returns a copy of the probe with zero fields filled in.
+func (p Probe) withDefaults() Probe {
+	if p.PeriodSeconds == 0 {
+		p.PeriodSeconds = defaultPeriodSeconds
+	}
+	if p.TimeoutSeconds == 0 {
+		p.TimeoutSeconds = defaultTimeoutSeconds
+	}
+	if p.FailureThreshold == 0 {
+		p.FailureThreshold = defaultFailureThreshold
+	}
+	return p
+}
+
+// Period, Timeout, Threshold and InitialDelay return the effective values
+// (defaults applied) as their natural types.
+func (p Probe) Period() time.Duration {
+	return time.Duration(p.withDefaults().PeriodSeconds) * time.Second
+}
+func (p Probe) Timeout() time.Duration {
+	return time.Duration(p.withDefaults().TimeoutSeconds) * time.Second
+}
+func (p Probe) Threshold() int { return p.withDefaults().FailureThreshold }
+func (p Probe) InitialDelay() time.Duration {
+	return time.Duration(p.InitialDelaySec) * time.Second
 }
 
 // Spec is a full cluster declaration: a set of workloads keyed by name.
@@ -47,6 +96,15 @@ func (s *Spec) Validate() error {
 			return fmt.Errorf("workload %q: empty image", w.Name)
 		case w.Replicas < 0:
 			return fmt.Errorf("workload %q: negative replicas", w.Name)
+		}
+		if w.Liveness != nil {
+			if len(w.Liveness.Exec) == 0 {
+				return fmt.Errorf("workload %q: liveness probe needs a non-empty exec command", w.Name)
+			}
+			if w.Liveness.FailureThreshold < 0 || w.Liveness.PeriodSeconds < 0 ||
+				w.Liveness.TimeoutSeconds < 0 || w.Liveness.InitialDelaySec < 0 {
+				return fmt.Errorf("workload %q: liveness probe fields must be non-negative", w.Name)
+			}
 		}
 		seen[w.Name] = true
 	}

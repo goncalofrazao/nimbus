@@ -118,7 +118,7 @@ func runCmd(log *slog.Logger, args []string) error {
 			switch {
 			case a.Err != nil:
 				lvl = slog.LevelError
-			case a.Verb == "backoff":
+			case a.Verb == "backoff", a.Verb == "unhealthy", a.Verb == "killed":
 				lvl = slog.LevelWarn
 			}
 			attrs := []any{"action", a.Verb, "workload", a.Workload, "replica", a.Replica, "id", a.ID}

@@ -64,6 +64,9 @@ daemon going down must never take your containers with it.
   **idempotent** (a converged cluster yields no actions), **convergent**
   (each pass self-heals crashed replicas), and **fault-tolerant** (one
   container's failure is recorded and skipped, never aborting the pass).
+  Crashing replicas restart on **exponential backoff** (CrashLoopBackOff), and
+  **exec liveness probes** catch replicas that are up but wedged and restart
+  them.
 - **`cmd/nimbusd`** — the node daemon: control loop, `status`, `down`,
   signal-driven reload and graceful shutdown.
 
@@ -101,9 +104,11 @@ Toward a reliable, real cluster manager:
 
 - [x] Hand-written container runtime client (Docker Engine API, stdlib only)
 - [x] Declarative desired state + self-healing reconcile loop (single node)
+- [x] Restart backoff (CrashLoopBackOff) for crashing replicas
+- [x] Exec liveness probes (restart wedged-but-running replicas)
+- [ ] Readiness probes + service routing
 - [ ] Persistent control-plane store (desired state survives restarts)
 - [ ] Control-plane / node-agent split over a real API
-- [ ] Health checks & restart backoff (liveness, crash-loop handling)
 - [ ] Multi-node scheduling (place replicas across hosts)
 - [ ] Pod networking & service discovery
 - [ ] Wire in the predictive autoscaler + bin-packing scheduler as the brain

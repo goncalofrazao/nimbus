@@ -3,7 +3,13 @@
     {
       "name": "web",
       "image": "nginx:alpine",
-      "replicas": 2
+      "replicas": 2,
+      "liveness": {
+        "exec": ["wget", "-q", "-O-", "http://localhost/"],
+        "periodSeconds": 10,
+        "failureThreshold": 3,
+        "initialDelaySeconds": 5
+      }
     },
     {
       "name": "worker",

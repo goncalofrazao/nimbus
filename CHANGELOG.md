@@ -23,6 +23,12 @@ healing reconcile loop that actually runs containers.
   stably for 30s. First creation and external deletions still heal
   immediately — backoff is only for genuine crash loops. Backoff state is
   ephemeral controller state, never part of desired state.
+- Exec liveness probes: a workload can declare a `liveness` exec check (with
+  period, timeout, failureThreshold, initialDelaySeconds). The agent runs it
+  inside each replica via the Docker exec API; a replica that fails the
+  threshold consecutively is killed and restarted through the backoff path.
+  Exec probes are namespace-local, so they work without container networking.
+  New `runtime.Exec` (create/start/inspect over the Docker exec API).
 
 ### Simulation engine (the future "brain", retained)
 
