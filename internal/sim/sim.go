@@ -70,9 +70,29 @@ func synthTrace(ticks int, seed int64, base, amp, phase float64, spikes ...spike
 
 // clusterAutoscaler adds nodes for unschedulable pods and reclaims nodes
 // that sit empty past a grace period. Shared by both control planes.
+// With maxSpotShare > 0 it provisions spot-tier nodes up to that share of
+// the fleet and keeps one node of spare headroom so a preemption's pods
+// have somewhere to land while the replacement boots.
 type clusterAutoscaler struct {
-	emptyGrace int
-	minNodes   int
+	emptyGrace   int
+	minNodes     int
+	maxSpotShare float64
+}
+
+// newNode picks the tier for the next provisioned node.
+func (c clusterAutoscaler) newNode(st *cluster.State, tick int) *cluster.Node {
+	if c.maxSpotShare > 0 {
+		spot := 0
+		for _, n := range st.Nodes {
+			if n.Spot {
+				spot++
+			}
+		}
+		if float64(spot+1) <= c.maxSpotShare*float64(len(st.Nodes)+1) {
+			return cluster.NewSpotNode(tick)
+		}
+	}
+	return cluster.NewNode(tick)
 }
 
 func (c clusterAutoscaler) step(st *cluster.State, tick int) {
@@ -95,7 +115,21 @@ func (c clusterAutoscaler) step(st *cluster.State, tick int) {
 			missing = m
 		}
 		for i := 0; i < int(missing); i++ {
-			st.Nodes = append(st.Nodes, cluster.NewNode(tick))
+			st.Nodes = append(st.Nodes, c.newNode(st, tick))
+		}
+	}
+
+	// Spot mode: keep one empty node as spare headroom for preemptions.
+	if c.maxSpotShare > 0 {
+		hasSpare := false
+		for _, n := range st.Nodes {
+			if len(n.Pods) == 0 {
+				hasSpare = true
+				break
+			}
+		}
+		if !hasSpare {
+			st.Nodes = append(st.Nodes, c.newNode(st, tick))
 		}
 	}
 
@@ -112,6 +146,9 @@ func (c clusterAutoscaler) step(st *cluster.State, tick int) {
 			removable = append(removable, n)
 		}
 	}
+	if c.maxSpotShare > 0 && len(removable) > 0 {
+		removable = removable[:len(removable)-1] // the spare survives reclaim
+	}
 	keep := len(st.Nodes) - len(removable)
 	for len(removable) > 0 && keep < c.minNodes {
 		removable = removable[:len(removable)-1]
@@ -120,6 +157,20 @@ func (c clusterAutoscaler) step(st *cluster.State, tick int) {
 	for _, n := range removable {
 		st.RemoveNode(n)
 	}
+}
+
+// preemptSpot models the provider reclaiming spot capacity: each spot node
+// dies with probability prob per tick, its pods thrown back to pending.
+func preemptSpot(st *cluster.State, rng *rand.Rand, prob float64) {
+	var keep []*cluster.Node
+	for _, n := range st.Nodes {
+		if n.Spot && rng.Float64() < prob {
+			st.Pending = append(st.Pending, n.Pods...)
+			continue
+		}
+		keep = append(keep, n)
+	}
+	st.Nodes = keep
 }
 
 // Metrics collects the per-tick series and derives the scorecard.
@@ -134,6 +185,7 @@ type Metrics struct {
 	Nodes    []int
 	Replicas []int
 	Util     []float64
+	Cost     []float64 // $ accrued per tick across the fleet
 }
 
 func (m *Metrics) SLOViolationTicks() int {
@@ -177,6 +229,15 @@ func (m *Metrics) AvgUtilization() float64 {
 	return 100 * s / float64(c)
 }
 
+// CostDollars is the fleet bill: node-hours weighted by tier price.
+func (m *Metrics) CostDollars() float64 {
+	s := 0.0
+	for _, c := range m.Cost {
+		s += c
+	}
+	return s
+}
+
 func (m *Metrics) PeakNodes() int {
 	best := 0
 	for _, n := range m.Nodes {
@@ -187,14 +248,42 @@ func (m *Metrics) PeakNodes() int {
 	return best
 }
 
+// Option tweaks the control-plane configuration for a Run.
+type Option func(*config)
+
+type config struct {
+	maxSpotShare float64
+	preemptProb  float64
+	preemptSeed  int64
+}
+
+// WithSpot lets the cluster autoscaler fill up to share of the fleet with
+// spot-tier nodes, each preempted with probability prob per tick.
+func WithSpot(share, prob float64, seed int64) Option {
+	return func(c *config) {
+		c.maxSpotShare = share
+		c.preemptProb = prob
+		c.preemptSeed = seed
+	}
+}
+
 // Run replays the workload traces against one control plane and returns its
 // metrics. newAutoscaler builds one replica autoscaler per workload.
 func Run(name string, sched scheduler.Scheduler,
 	newAutoscaler func(rpsPerReplica float64) autoscaler.Autoscaler,
-	workloads []Workload) *Metrics {
+	workloads []Workload, opts ...Option) *Metrics {
+
+	var cfg config
+	for _, o := range opts {
+		o(&cfg)
+	}
 
 	st := &cluster.State{Nodes: []*cluster.Node{cluster.NewNode(-10)}} // warm node
-	ca := clusterAutoscaler{emptyGrace: 8, minNodes: 1}
+	ca := clusterAutoscaler{emptyGrace: 8, minNodes: 1, maxSpotShare: cfg.maxSpotShare}
+	var preemptRNG *rand.Rand
+	if cfg.preemptProb > 0 {
+		preemptRNG = rand.New(rand.NewSource(cfg.preemptSeed))
+	}
 	m := &Metrics{Name: name}
 
 	as := make([]autoscaler.Autoscaler, len(workloads))
@@ -204,6 +293,11 @@ func Run(name string, sched scheduler.Scheduler,
 
 	ticks := len(workloads[0].Trace)
 	for tick := 0; tick < ticks; tick++ {
+		// 0. Provider-side spot preemptions --------------------------------
+		if preemptRNG != nil {
+			preemptSpot(st, preemptRNG, cfg.preemptProb)
+		}
+
 		// 1. Per-workload replica autoscaling -----------------------------
 		for i, w := range workloads {
 			demand := w.Trace[tick]
@@ -252,12 +346,18 @@ func Run(name string, sched scheduler.Scheduler,
 			util /= float64(len(ready))
 		}
 
+		cost := 0.0
+		for _, n := range st.Nodes {
+			cost += n.Price
+		}
+
 		m.Demand = append(m.Demand, demand)
 		m.Capacity = append(m.Capacity, capacity)
 		m.Unserved = append(m.Unserved, unserved)
 		m.Nodes = append(m.Nodes, len(st.Nodes))
 		m.Replicas = append(m.Replicas, serving)
 		m.Util = append(m.Util, util)
+		m.Cost = append(m.Cost, cost/60)
 	}
 	return m
 }

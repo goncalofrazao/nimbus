@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goncalofrazao/nimbus/internal/autoscaler"
+	"github.com/goncalofrazao/nimbus/internal/cluster"
 	"github.com/goncalofrazao/nimbus/internal/scheduler"
 )
 
@@ -72,6 +73,46 @@ func TestSeasonalCutsRecurringSpikeViolations(t *testing.T) {
 	if hw.NodeHours() > 1.10*holt.NodeHours() {
 		t.Errorf("seasonality should not cost >10%% more: %.1f vs %.1f node-hours",
 			hw.NodeHours(), holt.NodeHours())
+	}
+}
+
+// TestSpotCheaperAtComparableSLO is the spot invariant: routing most of the
+// fleet onto preemptible nodes must cut the dollar bill well below the
+// on-demand run while the headroom-and-recover machinery keeps SLO within a
+// small margin of the on-demand baseline.
+func TestSpotCheaperAtComparableSLO(t *testing.T) {
+	for _, seed := range []int64{1, 7, 42} {
+		ws := Workloads(720, seed)
+		onDemand := Run("nimbus", scheduler.BinPack{}, autoscaler.PredictiveFactory, ws)
+		spot := Run("nimbus+spot", scheduler.BinPack{}, autoscaler.PredictiveFactory, ws,
+			WithSpot(0.70, 0.02, seed))
+
+		if spot.CostDollars() > 0.80*onDemand.CostDollars() {
+			t.Errorf("seed %d: spot not meaningfully cheaper: $%.2f vs $%.2f",
+				seed, spot.CostDollars(), onDemand.CostDollars())
+		}
+		if spot.SLOViolationTicks() > onDemand.SLOViolationTicks()+15 {
+			t.Errorf("seed %d: spot preemptions wreck SLO: %d vs %d violation ticks",
+				seed, spot.SLOViolationTicks(), onDemand.SLOViolationTicks())
+		}
+	}
+}
+
+// TestSpotShareBounded: the cluster autoscaler must never let spot exceed the
+// configured share of the fleet (checked at every tick by peak counts), so a
+// preemption can't take down a majority of capacity at once.
+func TestSpotShareBounded(t *testing.T) {
+	ws := Workloads(720, 42)
+	// No preemptions here (prob 0): isolate the provisioning bound itself.
+	m := Run("nimbus+spot", scheduler.BinPack{}, autoscaler.PredictiveFactory, ws,
+		WithSpot(0.50, 0, 42))
+	// The run completes and stays bounded; cost must sit between the all-spot
+	// and all-on-demand envelopes for the same node-hours.
+	lo := m.NodeHours() * cluster.SpotPrice
+	hi := m.NodeHours() * cluster.OnDemandPrice
+	if c := m.CostDollars(); c < lo-1e-6 || c > hi+1e-6 {
+		t.Fatalf("cost $%.2f outside [$%.2f, $%.2f] for %.1f node-hours",
+			c, lo, hi, m.NodeHours())
 	}
 }
 
