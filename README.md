@@ -96,7 +96,21 @@ examples/              sample cluster specs
 
 cmd/nimbus/            simulation benchmark CLI (the "brain", below)
 internal/{autoscaler,scheduler,sim,cluster,report}/   scheduling research engine
+test/integration/      end-to-end tests against a real Docker daemon
 ```
+
+## Testing
+
+```bash
+make test          # hermetic unit tests — no Docker needed (also runs in CI)
+make integration   # end-to-end tests against a real Docker daemon
+```
+
+Unit tests cover the reconcile/backoff/probe logic against an in-memory fake
+runtime, so they're fast and need no daemon. The integration suite
+(`test/integration`, behind the `integration` build tag) drives the real
+runtime client and reconcile loop against live containers — converge,
+self-heal, scale-down, liveness kill+restart. Both run in CI on every push.
 
 ## Roadmap
 
