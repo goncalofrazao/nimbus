@@ -23,13 +23,23 @@ type fakeRuntime struct {
 	// absent IDs probe healthy (0). execs counts probe invocations.
 	exitFor map[string]int
 	execs   int
+	// opDelay simulates per-operation runtime latency; it is slept OUTSIDE the
+	// lock so concurrent operations actually overlap (used to test parallelism).
+	opDelay time.Duration
 }
 
 func newFake() *fakeRuntime {
 	return &fakeRuntime{byID: map[string]*runtime.Container{}, fails: map[string]error{}, exitFor: map[string]int{}}
 }
 
+func (f *fakeRuntime) sleep() {
+	if f.opDelay > 0 {
+		time.Sleep(f.opDelay)
+	}
+}
+
 func (f *fakeRuntime) Exec(_ context.Context, id string, _ []string) (int, error) {
+	f.sleep()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fails["exec"]; err != nil {
@@ -40,6 +50,7 @@ func (f *fakeRuntime) Exec(_ context.Context, id string, _ []string) (int, error
 }
 
 func (f *fakeRuntime) Pull(_ context.Context, image string) error {
+	f.sleep()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fails["pull"]; err != nil {
@@ -50,6 +61,7 @@ func (f *fakeRuntime) Pull(_ context.Context, image string) error {
 }
 
 func (f *fakeRuntime) Create(_ context.Context, s runtime.ContainerSpec) (string, error) {
+	f.sleep()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fails["create"]; err != nil {
@@ -66,6 +78,7 @@ func (f *fakeRuntime) Create(_ context.Context, s runtime.ContainerSpec) (string
 }
 
 func (f *fakeRuntime) Start(_ context.Context, id string) error {
+	f.sleep()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fails["start"]; err != nil {
@@ -80,6 +93,7 @@ func (f *fakeRuntime) Start(_ context.Context, id string) error {
 }
 
 func (f *fakeRuntime) Stop(_ context.Context, id string, _ time.Duration) error {
+	f.sleep()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if c, ok := f.byID[id]; ok {
@@ -89,6 +103,7 @@ func (f *fakeRuntime) Stop(_ context.Context, id string, _ time.Duration) error 
 }
 
 func (f *fakeRuntime) Remove(_ context.Context, id string, _ bool) error {
+	f.sleep()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.byID, id)

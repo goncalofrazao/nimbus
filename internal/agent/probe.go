@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/goncalofrazao/nimbus/internal/runtime"
@@ -17,73 +18,130 @@ type replicaProbe struct {
 }
 
 // probeTable holds per-replica liveness state, keyed by container name. Like
-// the backoff table it is ephemeral controller state, never desired state.
+// the backoff table it is ephemeral controller state, never desired state, and
+// mutex-guarded so probes can run concurrently.
 type probeTable struct {
-	m map[string]*replicaProbe
+	mu sync.Mutex
+	m  map[string]*replicaProbe
 }
 
 func newProbeTable() *probeTable { return &probeTable{m: map[string]*replicaProbe{}} }
 
-func (t *probeTable) forget(key string) { delete(t.m, key) }
+func (t *probeTable) forget(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.m, key)
+}
 
-// track returns the probe state for a replica, (re)initializing it whenever
-// the underlying container changes identity (a restart resets the history).
-func (t *probeTable) track(key, containerID string, now time.Time) *replicaProbe {
+// due decides, under lock, whether a probe should run for this replica now. It
+// (re)initializes state when the underlying container changes (a restart
+// resets the history), honors the initial delay and period, and stamps
+// lastProbe when it returns true — so the blocking probe itself runs outside
+// the lock and two passes never double-fire.
+func (t *probeTable) due(key, containerID string, now time.Time, initialDelay, period time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	p := t.m[key]
 	if p == nil || p.containerID != containerID {
 		p = &replicaProbe{containerID: containerID, seenAt: now}
 		t.m[key] = p
 	}
-	return p
+	if now.Sub(p.seenAt) < initialDelay {
+		return false
+	}
+	if !p.lastProbe.IsZero() && now.Sub(p.lastProbe) < period {
+		return false
+	}
+	p.lastProbe = now
+	return true
 }
 
-// probeAll runs due liveness probes against the running replicas and kills any
-// that have failed FailureThreshold times in a row. A killed container is set
-// to "exited" in have so the caller's ensure loop restarts it under backoff.
-func (r *Reconciler) probeAll(ctx context.Context, desired map[string]spec.Workload, have map[replicaKey]runtime.Container) []Action {
-	now := r.now()
-	var actions []Action
+// record folds a probe result into the streak and reports whether the replica
+// should be killed (threshold consecutive failures reached).
+func (t *probeTable) record(key string, healthy bool, threshold int) (failures int, kill bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p := t.m[key]
+	if p == nil {
+		return 0, false
+	}
+	if healthy {
+		p.failures = 0
+		return 0, false
+	}
+	p.failures++
+	return p.failures, p.failures >= threshold
+}
 
+// probeResult is what one replica's liveness check produced this pass.
+type probeResult struct {
+	action Action
+	hasAct bool
+	killed bool // if set, the caller marks the replica exited so ensure restarts it
+	key    replicaKey
+}
+
+// probeAll runs due liveness probes against the running replicas concurrently
+// and reports which ones must be killed. Killing (the runtime Stop) happens in
+// the parallel task, but mutating the shared `have` map is left to the caller,
+// which does it sequentially after this returns.
+func (r *Reconciler) probeAll(ctx context.Context, desired map[string]spec.Workload, have map[replicaKey]runtime.Container) ([]Action, []replicaKey) {
+	now := r.now()
+
+	type job struct {
+		key   replicaKey
+		c     runtime.Container
+		probe spec.Probe
+	}
+	var jobs []job
 	for k, c := range have {
 		w, ok := desired[k.workload]
 		if !ok || w.Liveness == nil || !c.Running() {
 			continue
 		}
-		probe := *w.Liveness
-		st := r.probes.track(containerName(k.workload, k.replica), c.ID, now)
-
-		// Respect the initial delay and the probe period.
-		if now.Sub(st.seenAt) < probe.InitialDelay() {
-			continue
-		}
-		if !st.lastProbe.IsZero() && now.Sub(st.lastProbe) < probe.Period() {
-			continue
-		}
-		st.lastProbe = now
-
-		healthy := r.runProbe(ctx, c.ID, probe)
-		if healthy {
-			st.failures = 0
-			continue
-		}
-		st.failures++
-		if st.failures < probe.Threshold() {
-			actions = append(actions, Action{Verb: "unhealthy", Workload: k.workload,
-				Replica: k.replica, ID: c.ID, Failures: st.failures})
-			continue
-		}
-
-		// Threshold reached: kill it. Best-effort stop; the ensure loop will
-		// restart it (subject to crash-loop backoff). Mark it exited locally so
-		// that restart actually happens this pass.
-		_ = r.rt.Stop(ctx, c.ID, stopGrace)
-		c.State = "exited"
-		have[k] = c
-		r.probes.forget(containerName(k.workload, k.replica))
-		actions = append(actions, Action{Verb: "killed", Workload: k.workload,
-			Replica: k.replica, ID: c.ID, Failures: st.failures})
+		jobs = append(jobs, job{key: k, c: c, probe: *w.Liveness})
 	}
-	return actions
+
+	tasks := make([]func() probeResult, len(jobs))
+	for i := range jobs {
+		j := jobs[i]
+		name := containerName(j.key.workload, j.key.replica)
+		tasks[i] = func() probeResult {
+			if !r.probes.due(name, j.c.ID, now, j.probe.InitialDelay(), j.probe.Period()) {
+				return probeResult{}
+			}
+			healthy := r.runProbe(ctx, j.c.ID, j.probe)
+			failures, kill := r.probes.record(name, healthy, j.probe.Threshold())
+			if healthy {
+				return probeResult{}
+			}
+			if !kill {
+				return probeResult{hasAct: true, action: Action{Verb: "unhealthy",
+					Workload: j.key.workload, Replica: j.key.replica, ID: j.c.ID, Failures: failures}}
+			}
+			// Threshold reached: kill it (the ensure phase restarts it under
+			// backoff). Best-effort stop; force-remove is not used so the
+			// container stays as an exited replica to restart in place.
+			_ = r.rt.Stop(ctx, j.c.ID, stopGrace)
+			r.probes.forget(name)
+			return probeResult{hasAct: true, killed: true, key: j.key,
+				action: Action{Verb: "killed", Workload: j.key.workload,
+					Replica: j.key.replica, ID: j.c.ID, Failures: failures}}
+		}
+	}
+
+	results := runParallel(r.parallelism, tasks)
+	var actions []Action
+	var killed []replicaKey
+	for _, res := range results {
+		if res.hasAct {
+			actions = append(actions, res.action)
+		}
+		if res.killed {
+			killed = append(killed, res.key)
+		}
+	}
+	return actions, killed
 }
 
 // runProbe executes one exec probe under its timeout; healthy iff exit 0.
