@@ -81,7 +81,10 @@ daemon going down must never take your containers with it.
   container's failure is recorded and skipped, never aborting the pass).
   Crashing replicas restart on **exponential backoff** (CrashLoopBackOff), and
   **exec liveness probes** catch replicas that are up but wedged and restart
-  them.
+  them. Each pass runs its per-replica work (probes, creates, restarts, removes)
+  with **bounded concurrency**, so converging or tearing down many replicas is
+  fast instead of serial — the shared controller state (backoff and probe
+  tables) is mutex-guarded.
 - **`cmd/nimbusd`** — the node daemon: control loop, `status`, `down`,
   signal-driven reload and graceful shutdown.
 
@@ -137,7 +140,7 @@ Toward a reliable, real cluster manager:
 - [x] Restart backoff (CrashLoopBackOff) for crashing replicas
 - [x] Exec liveness probes (restart wedged-but-running replicas)
 - [x] Persistent, crash-safe desired-state store (survives restarts)
-- [ ] Concurrent reconcile (faster teardown of many replicas)
+- [x] Concurrent reconcile (bounded parallelism; fast teardown of many replicas)
 - [ ] Readiness probes + service routing
 - [ ] Control-plane / node-agent split over a real API
 - [ ] Multi-node scheduling (place replicas across hosts)

@@ -15,6 +15,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -47,15 +48,29 @@ type replicaKey struct {
 
 // Reconciler converges one node's containers toward the desired spec.
 type Reconciler struct {
-	rt      Runtime
-	backoff *backoffTable
-	probes  *probeTable
-	now     func() time.Time // injectable clock for deterministic tests
+	rt          Runtime
+	backoff     *backoffTable
+	probes      *probeTable
+	now         func() time.Time // injectable clock for deterministic tests
+	parallelism int              // max concurrent container operations per pass
 }
 
 // New returns a Reconciler backed by rt.
 func New(rt Runtime) *Reconciler {
-	return &Reconciler{rt: rt, backoff: newBackoffTable(), probes: newProbeTable(), now: time.Now}
+	return &Reconciler{
+		rt: rt, backoff: newBackoffTable(), probes: newProbeTable(),
+		now: time.Now, parallelism: defaultParallelism,
+	}
+}
+
+// SetParallelism caps how many container operations a pass runs at once
+// (minimum 1). Mainly for tuning and for forcing deterministic, serial passes
+// in tests.
+func (r *Reconciler) SetParallelism(n int) {
+	if n < 1 {
+		n = 1
+	}
+	r.parallelism = n
 }
 
 // Action records one thing the reconciler did (or tried to do) this pass.
@@ -146,40 +161,99 @@ func (r *Reconciler) Reconcile(ctx context.Context, s *spec.Spec) (Report, error
 	}
 
 	desired := make(map[string]spec.Workload, len(s.Workloads))
+	desiredKeys := make(map[replicaKey]bool)
 	for _, w := range s.Workloads {
 		desired[w.Name] = w
+		for i := 0; i < w.Replicas; i++ {
+			desiredKeys[replicaKey{w.Name, i}] = true
+		}
 	}
 
 	var rep Report
 
-	// 0. Liveness: probe running replicas and kill the unhealthy ones. A
-	//    killed container is marked exited in `have` so the ensure loop below
-	//    restarts it through the normal backoff path.
-	rep.Actions = append(rep.Actions, r.probeAll(ctx, desired, have)...)
+	// Each phase runs its per-replica work concurrently (bounded), but the
+	// phases are sequential so they never race on the shared `have` map. The
+	// work is I/O-bound on the runtime, so this turns an O(replicas) serial
+	// pass — dominated by stop grace periods and pulls — into a fast one.
 
-	// 1. Ensure every desired replica exists and is running.
+	// Phase 0 — liveness: probe running replicas; kill the unhealthy ones.
+	// The Stop happens inside the parallel probe; marking the replica exited in
+	// `have` is done here, sequentially, so the ensure phase restarts it.
+	probeActs, killed := r.probeAll(ctx, desired, have)
+	for _, k := range killed {
+		c := have[k]
+		c.State = "exited"
+		have[k] = c
+	}
+
+	// Phase 1 — ensure every desired replica exists and is running.
+	ensureTasks := make([]func() Action, 0, len(desiredKeys))
 	for _, name := range s.Names() {
 		w := desired[name]
 		for i := 0; i < w.Replicas; i++ {
-			k := replicaKey{w.Name, i}
-			cur, ok := have[k]
-			delete(have, k) // consume; whatever remains is excess
-			rep.Actions = append(rep.Actions, r.ensureReplica(ctx, w, i, cur, ok))
+			w, i := w, i
+			cur, ok := have[replicaKey{w.Name, i}]
+			ensureTasks = append(ensureTasks, func() Action {
+				return r.ensureReplica(ctx, w, i, cur, ok)
+			})
 		}
 	}
 
-	// 2. Anything left in `have` is an excess replica (count scaled down or
-	//    workload removed). Reclaim it.
+	// Phase 2 — reclaim: excess replicas (not desired) and orphans.
+	type removal struct {
+		workload string
+		replica  int
+		c        runtime.Container
+	}
+	var removals []removal
 	for k, c := range have {
-		rep.Actions = append(rep.Actions, r.removeContainer(ctx, k.workload, k.replica, c))
+		if !desiredKeys[k] {
+			removals = append(removals, removal{k.workload, k.replica, c})
+		}
 	}
-
-	// 3. Reclaim orphans (managed containers with no usable identity).
 	for _, c := range orphans {
-		rep.Actions = append(rep.Actions, r.removeContainer(ctx, c.Workload(), -1, c))
+		removals = append(removals, removal{c.Workload(), -1, c})
+	}
+	removeTasks := make([]func() Action, len(removals))
+	for i := range removals {
+		rm := removals[i]
+		removeTasks[i] = func() Action {
+			return r.removeContainer(ctx, rm.workload, rm.replica, rm.c)
+		}
 	}
 
+	rep.Actions = append(rep.Actions, probeActs...)
+	rep.Actions = append(rep.Actions, runParallel(r.parallelism, ensureTasks)...)
+	rep.Actions = append(rep.Actions, runParallel(r.parallelism, removeTasks)...)
+
+	// Stable order regardless of completion order, for deterministic output.
+	sortActions(rep.Actions)
 	return rep, nil
+}
+
+// sortActions orders actions by workload, then replica, then verb — so logs
+// and test assertions don't depend on goroutine scheduling. No-op "none"
+// actions sort last within a replica, so a replica's meaningful action (if
+// any) comes first.
+func sortActions(as []Action) {
+	rank := func(verb string) int {
+		if verb == "none" {
+			return 1
+		}
+		return 0
+	}
+	sort.SliceStable(as, func(i, j int) bool {
+		if as[i].Workload != as[j].Workload {
+			return as[i].Workload < as[j].Workload
+		}
+		if as[i].Replica != as[j].Replica {
+			return as[i].Replica < as[j].Replica
+		}
+		if ri, rj := rank(as[i].Verb), rank(as[j].Verb); ri != rj {
+			return ri < rj
+		}
+		return as[i].Verb < as[j].Verb
+	})
 }
 
 // ensureReplica guarantees replica i of w is present and running, pacing
@@ -200,10 +274,9 @@ func (r *Reconciler) ensureReplica(ctx context.Context, w spec.Workload, i int, 
 	// removed behind our back after a prior restart, counts as a death.)
 	firstCreate := !exists && !r.backoff.known(key)
 	if !firstCreate {
-		if ok, wait := r.backoff.ready(key, now); !ok {
-			b := r.backoff.m[key]
+		if ok, wait, failures := r.backoff.ready(key, now); !ok {
 			return Action{Verb: "backoff", Workload: w.Name, Replica: i, ID: cur.ID,
-				Failures: b.failures, Wait: wait}
+				Failures: failures, Wait: wait}
 		}
 	}
 

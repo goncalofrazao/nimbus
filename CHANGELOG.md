@@ -30,6 +30,14 @@ healing reconcile loop that actually runs containers.
   Exec probes are namespace-local, so they work without container networking.
   New `runtime.Exec` (create/start/inspect over the Docker exec API).
 
+- Concurrent reconcile: each reconcile pass now runs its per-replica work
+  (liveness probes, creates, restarts, removes) with bounded parallelism
+  (default 8) instead of serially. Tearing down or converging many replicas is
+  no longer O(replicas × stop-grace) — a 6-replica teardown that took ~30s is
+  now ~5s. The shared controller state (backoff and probe tables) is
+  mutex-guarded; actions are sorted for deterministic output. Tunable via
+  `Reconciler.SetParallelism`. Tested under `-race`, including a
+  parallel-beats-serial timing test.
 - Persistent desired-state store (`internal/store`): the control plane's
   durable memory. Desired state survives daemon restarts. Writes are crash-safe
   (temp file → fsync → atomic rename → fsync dir), so a crash never leaves a
