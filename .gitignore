@@ -2,6 +2,9 @@
 /nimbus
 /nimbusd
 
+# local desired-state store
+nimbus-state.json
+
 # OS noise
 .DS_Store
 
