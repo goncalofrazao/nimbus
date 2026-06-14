@@ -30,6 +30,14 @@ healing reconcile loop that actually runs containers.
   Exec probes are namespace-local, so they work without container networking.
   New `runtime.Exec` (create/start/inspect over the Docker exec API).
 
+- Persistent desired-state store (`internal/store`): the control plane's
+  durable memory. Desired state survives daemon restarts. Writes are crash-safe
+  (temp file → fsync → atomic rename → fsync dir), so a crash never leaves a
+  torn file; a monotonic generation tracks changes. `nimbusd` grows
+  `apply`/`scale`/`delete`/`get` commands that mutate the store, and `run` now
+  reconciles from it, reloading each pass so those mutations take effect live
+  (it still accepts `-spec` to seed). Covered by unit tests including
+  durability-across-reopen, atomic batch apply, and concurrent mutation (race).
 - Integration test suite (`test/integration`, build tag `integration`): real
   end-to-end tests against a live Docker daemon — runtime lifecycle, exec,
   reconcile converge + self-heal, scale-down, and liveness kill+restart. A new

@@ -28,10 +28,20 @@ Requires a reachable Docker daemon (`/var/run/docker.sock`).
 go build -o nimbusd ./cmd/nimbusd
 
 # Declare a cluster (2× nginx, 3× busybox worker) — see examples/cluster.json
-./nimbusd run -spec examples/cluster.json -interval 5s   # the control loop
-./nimbusd status                                          # what's running
-./nimbusd down                                            # tear it all down
+./nimbusd apply -spec examples/cluster.json   # store the desired state
+./nimbusd run                                 # the control loop (reads the store)
+./nimbusd status                              # what's actually running
+./nimbusd scale web 4                         # mutate desired state live
+./nimbusd delete worker                       # the daemon reconciles it away
+./nimbusd get                                 # print the stored desired state
+./nimbusd down                                # tear down all containers
 ```
+
+Desired state lives in a **persistent, crash-safe store** (a JSON file written
+atomically). `apply`/`scale`/`delete` mutate it; `run` reconciles from it and
+reloads each pass, so those commands take effect on a running daemon. For a
+one-shot start you can still seed straight from a file: `nimbusd run -spec
+examples/cluster.json`.
 
 It self-heals. Kill a container behind its back and the next reconcile brings
 it back:
@@ -48,14 +58,19 @@ daemon going down must never take your containers with it.
 ## How it works
 
 ```
-              declare                  reconcile (every interval)
-  cluster.json ──────▶ spec.Spec ──────▶ Reconciler ──────▶ Docker Engine API
-   (desired state)                          │  list → diff → act      (real containers)
-                                            └─ create / restart / remove
+   apply/scale/delete        reconcile (every interval)
+  cluster.json ──▶ Store ──▶ Reconciler ──────▶ Docker Engine API
+   (durable desired state)      │  list → diff → act      (real containers)
+                                └─ create / restart / remove
 ```
 
 - **`internal/spec`** — the declarative desired state (workloads = image +
   replica count + command), loaded and validated from JSON.
+- **`internal/store`** — the durable, crash-safe desired-state store. Every
+  mutation is written to a temp file, fsync'd, and atomically renamed over the
+  real file (the directory is fsync'd too), so a crash leaves the last
+  committed state or the previous one — never a torn write. A monotonic
+  generation counter tracks changes.
 - **`internal/runtime`** — the from-scratch Docker Engine API client over the
   Unix socket: pull, create, start, stop, remove, list, inspect.
 - **`internal/agent`** — the reconcile loop, the reliability core. It is
@@ -88,9 +103,10 @@ built. Run `make run` / `make chart`.
 ## Layout
 
 ```
-cmd/nimbusd/           the node daemon (run / status / down)
+cmd/nimbusd/           the node daemon (run / apply / scale / delete / get / status / down)
 internal/runtime/      hand-written Docker Engine API client (stdlib only)
 internal/spec/         declarative desired state + validation
+internal/store/        durable, crash-safe desired-state store
 internal/agent/        the reconcile loop (declare → converge → self-heal)
 examples/              sample cluster specs
 
@@ -120,8 +136,9 @@ Toward a reliable, real cluster manager:
 - [x] Declarative desired state + self-healing reconcile loop (single node)
 - [x] Restart backoff (CrashLoopBackOff) for crashing replicas
 - [x] Exec liveness probes (restart wedged-but-running replicas)
+- [x] Persistent, crash-safe desired-state store (survives restarts)
+- [ ] Concurrent reconcile (faster teardown of many replicas)
 - [ ] Readiness probes + service routing
-- [ ] Persistent control-plane store (desired state survives restarts)
 - [ ] Control-plane / node-agent split over a real API
 - [ ] Multi-node scheduling (place replicas across hosts)
 - [ ] Pod networking & service discovery

@@ -76,35 +76,46 @@ type Spec struct {
 	Workloads []Workload `json:"workloads"`
 }
 
-// Validate checks the spec is internally consistent before anything acts on
-// it — bad input should be rejected at the door, not midway through a
-// reconcile that has already mutated the cluster.
+// Validate checks one workload is internally consistent. Bad input should be
+// rejected at the door, not midway through a reconcile that has already
+// mutated the cluster.
+func (w *Workload) Validate() error {
+	switch {
+	case strings.TrimSpace(w.Name) == "":
+		return fmt.Errorf("empty workload name")
+	case !validName(w.Name):
+		return fmt.Errorf("workload %q: name must be lowercase alphanumeric or '-'", w.Name)
+	case strings.TrimSpace(w.Image) == "":
+		return fmt.Errorf("workload %q: empty image", w.Name)
+	case w.Replicas < 0:
+		return fmt.Errorf("workload %q: negative replicas", w.Name)
+	}
+	if w.Liveness != nil {
+		if len(w.Liveness.Exec) == 0 {
+			return fmt.Errorf("workload %q: liveness probe needs a non-empty exec command", w.Name)
+		}
+		if w.Liveness.FailureThreshold < 0 || w.Liveness.PeriodSeconds < 0 ||
+			w.Liveness.TimeoutSeconds < 0 || w.Liveness.InitialDelaySec < 0 {
+			return fmt.Errorf("workload %q: liveness probe fields must be non-negative", w.Name)
+		}
+	}
+	return nil
+}
+
+// Validate checks the spec is internally consistent: at least one workload,
+// each individually valid, with unique names.
 func (s *Spec) Validate() error {
 	if len(s.Workloads) == 0 {
 		return fmt.Errorf("spec has no workloads")
 	}
 	seen := make(map[string]bool, len(s.Workloads))
-	for i, w := range s.Workloads {
-		switch {
-		case strings.TrimSpace(w.Name) == "":
-			return fmt.Errorf("workload %d: empty name", i)
-		case !validName(w.Name):
-			return fmt.Errorf("workload %q: name must be lowercase alphanumeric or '-'", w.Name)
-		case seen[w.Name]:
-			return fmt.Errorf("duplicate workload name %q", w.Name)
-		case strings.TrimSpace(w.Image) == "":
-			return fmt.Errorf("workload %q: empty image", w.Name)
-		case w.Replicas < 0:
-			return fmt.Errorf("workload %q: negative replicas", w.Name)
+	for i := range s.Workloads {
+		w := &s.Workloads[i]
+		if err := w.Validate(); err != nil {
+			return err
 		}
-		if w.Liveness != nil {
-			if len(w.Liveness.Exec) == 0 {
-				return fmt.Errorf("workload %q: liveness probe needs a non-empty exec command", w.Name)
-			}
-			if w.Liveness.FailureThreshold < 0 || w.Liveness.PeriodSeconds < 0 ||
-				w.Liveness.TimeoutSeconds < 0 || w.Liveness.InitialDelaySec < 0 {
-				return fmt.Errorf("workload %q: liveness probe fields must be non-negative", w.Name)
-			}
+		if seen[w.Name] {
+			return fmt.Errorf("duplicate workload name %q", w.Name)
 		}
 		seen[w.Name] = true
 	}
