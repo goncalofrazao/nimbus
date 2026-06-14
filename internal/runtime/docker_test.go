@@ -107,6 +107,47 @@ func TestLifecycle(t *testing.T) {
 	}
 }
 
+// TestExec drives the exec API used by liveness probes: a command's exit code
+// must come back faithfully.
+func TestExec(t *testing.T) {
+	c := dial(t)
+	ctx := context.Background()
+	const image = "busybox:latest"
+	if err := c.Pull(ctx, image); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	id, err := c.Create(ctx, ContainerSpec{
+		Name:  "nimbus-exec-" + time.Now().Format("150405.000000"),
+		Image: image,
+		Cmd:   []string{"sleep", "60"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer func() { _ = c.Remove(context.Background(), id, true) }()
+	if err := c.Start(ctx, id); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	cases := []struct {
+		cmd  []string
+		want int
+	}{
+		{[]string{"true"}, 0},
+		{[]string{"false"}, 1},
+		{[]string{"sh", "-c", "exit 7"}, 7},
+	}
+	for _, tc := range cases {
+		got, err := c.Exec(ctx, id, tc.cmd)
+		if err != nil {
+			t.Fatalf("exec %v: %v", tc.cmd, err)
+		}
+		if got != tc.want {
+			t.Errorf("exec %v exit = %d, want %d", tc.cmd, got, tc.want)
+		}
+	}
+}
+
 func TestSplitImage(t *testing.T) {
 	cases := map[string][2]string{
 		"busybox":              {"busybox", "latest"},

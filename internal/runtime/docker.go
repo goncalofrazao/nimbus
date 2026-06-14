@@ -203,6 +203,72 @@ func (c *Client) Stop(ctx context.Context, id string, timeout time.Duration) err
 	}
 }
 
+// Exec runs cmd inside a running container and returns its exit code. It is
+// the basis for exec liveness probes: a command that exits 0 means healthy.
+// Output is drained but discarded — only the exit status matters. The whole
+// exec is bounded by ctx (give it a probe-timeout context).
+func (c *Client) Exec(ctx context.Context, id string, cmd []string) (int, error) {
+	// 1. Create the exec instance.
+	createBody := map[string]any{
+		"AttachStdout": true,
+		"AttachStderr": true,
+		"Tty":          false,
+		"Cmd":          cmd,
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/containers/"+id+"/exec", createBody)
+	if err != nil {
+		return -1, fmt.Errorf("exec create %s: %w", short(id), err)
+	}
+	var created struct {
+		ID string `json:"Id"`
+	}
+	if resp.StatusCode != http.StatusCreated {
+		err := c.apiError(resp)
+		drain(resp)
+		return -1, fmt.Errorf("exec create %s: %w", short(id), err)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		drain(resp)
+		return -1, fmt.Errorf("exec create %s: decode: %w", short(id), err)
+	}
+	drain(resp)
+
+	// 2. Start it (non-detached) and drain the multiplexed output stream so
+	//    the command runs to completion.
+	startResp, err := c.do(ctx, http.MethodPost, "/exec/"+created.ID+"/start",
+		map[string]any{"Detach": false, "Tty": false})
+	if err != nil {
+		return -1, fmt.Errorf("exec start %s: %w", short(id), err)
+	}
+	if startResp.StatusCode != http.StatusOK {
+		err := c.apiError(startResp)
+		drain(startResp)
+		return -1, fmt.Errorf("exec start %s: %w", short(id), err)
+	}
+	drain(startResp)
+
+	// 3. Inspect for the exit code.
+	insResp, err := c.do(ctx, http.MethodGet, "/exec/"+created.ID+"/json", nil)
+	if err != nil {
+		return -1, fmt.Errorf("exec inspect %s: %w", short(id), err)
+	}
+	defer drain(insResp)
+	if insResp.StatusCode != http.StatusOK {
+		return -1, fmt.Errorf("exec inspect %s: %w", short(id), c.apiError(insResp))
+	}
+	var ins struct {
+		Running  bool `json:"Running"`
+		ExitCode int  `json:"ExitCode"`
+	}
+	if err := json.NewDecoder(insResp.Body).Decode(&ins); err != nil {
+		return -1, fmt.Errorf("exec inspect %s: decode: %w", short(id), err)
+	}
+	if ins.Running {
+		return -1, fmt.Errorf("exec %s: still running after start", short(id))
+	}
+	return ins.ExitCode, nil
+}
+
 // Remove deletes a container. With force it is killed first if running.
 // A missing container is treated as already-removed (success).
 func (c *Client) Remove(ctx context.Context, id string, force bool) error {
