@@ -24,6 +24,13 @@ const (
 	NodeMemCap = 8192
 )
 
+// Node prices in $ per node-hour. Spot capacity is ~65% cheaper but the
+// provider can preempt it at any time.
+const (
+	OnDemandPrice = 1.00
+	SpotPrice     = 0.35
+)
+
 // Node is a worker. Nodes take BootDelay ticks to become Ready.
 type Node struct {
 	ID         int64
@@ -31,16 +38,29 @@ type Node struct {
 	MemCap     int
 	BootDelay  int
 	CreatedAt  int
+	Spot       bool
+	Price      float64 // $ per node-hour
 	Pods       []*Pod
 	EmptySince int // tick when node last became empty; -1 = not empty
 }
 
-// NewNode provisions a standard node (4 cores, 8Gi) at the given tick.
+// NewNode provisions a standard on-demand node (4 cores, 8Gi) at the
+// given tick.
 func NewNode(tick int) *Node {
 	return &Node{
 		ID: nodeSeq.Add(1), CPUCap: NodeCPUCap, MemCap: NodeMemCap,
 		BootDelay: 5, CreatedAt: tick, EmptySince: -1,
+		Price: OnDemandPrice,
 	}
+}
+
+// NewSpotNode provisions a spot-tier worker: same shape, ~65% cheaper,
+// preemptible by the provider at any time.
+func NewSpotNode(tick int) *Node {
+	n := NewNode(tick)
+	n.Spot = true
+	n.Price = SpotPrice
+	return n
 }
 
 func (n *Node) Ready(tick int) bool { return tick-n.CreatedAt >= n.BootDelay }
