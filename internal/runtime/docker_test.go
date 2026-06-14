@@ -8,9 +8,14 @@ import (
 )
 
 // dial returns a Client if a Docker daemon is reachable, else skips the test.
-// These are real integration tests: they start and stop actual containers.
+// These are real integration tests: they start and stop actual containers and
+// pull from a registry, so they are opt-in (set NIMBUS_DOCKER_TEST=1) to keep
+// CI hermetic and free of Docker Hub flakiness.
 func dial(t *testing.T) *Client {
 	t.Helper()
+	if os.Getenv("NIMBUS_DOCKER_TEST") == "" {
+		t.Skip("set NIMBUS_DOCKER_TEST=1 to run Docker integration tests")
+	}
 	socket := DefaultSocket
 	if s := os.Getenv("DOCKER_SOCKET"); s != "" {
 		socket = s
