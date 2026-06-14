@@ -115,11 +115,23 @@ func runCmd(log *slog.Logger, args []string) error {
 				continue
 			}
 			lvl := slog.LevelInfo
-			if a.Err != nil {
+			switch {
+			case a.Err != nil:
 				lvl = slog.LevelError
+			case a.Verb == "backoff":
+				lvl = slog.LevelWarn
 			}
-			log.Log(ctx, lvl, "reconcile", "action", a.Verb,
-				"workload", a.Workload, "replica", a.Replica, "id", a.ID, "err", a.Err)
+			attrs := []any{"action", a.Verb, "workload", a.Workload, "replica", a.Replica, "id", a.ID}
+			if a.Failures > 0 {
+				attrs = append(attrs, "crashes", a.Failures)
+			}
+			if a.Verb == "backoff" {
+				attrs = append(attrs, "wait", a.Wait.Round(time.Second).String())
+			}
+			if a.Err != nil {
+				attrs = append(attrs, "err", a.Err)
+			}
+			log.Log(ctx, lvl, "reconcile", attrs...)
 		}
 		if rep.Changed() {
 			log.Info("converged", "changes", len(rep.Actions), "errors", len(rep.Errs()))
