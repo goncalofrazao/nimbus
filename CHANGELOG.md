@@ -17,6 +17,12 @@ healing reconcile loop that actually runs containers.
   and fault-tolerant (per-container failures don't abort the pass).
 - `cmd/nimbusd`: the node daemon — `run` (control loop with SIGHUP spec reload
   and a graceful shutdown that leaves workloads up), `status`, `down`.
+- Restart backoff (CrashLoopBackOff): a crash-looping replica is restarted on
+  an exponential delay (1s → 2s → 4s …, capped at 5m) instead of being
+  hammered every reconcile; the streak is forgiven once the replica runs
+  stably for 30s. First creation and external deletions still heal
+  immediately — backoff is only for genuine crash loops. Backoff state is
+  ephemeral controller state, never part of desired state.
 
 ### Simulation engine (the future "brain", retained)
 
