@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased — toward v1.0
+## Unreleased — orchestrator
+
+Nimbus turns into a real, self-hosting container orchestrator (it began as a
+scheduling/autoscaling *simulator*). First milestone: a single-node, self-
+healing reconcile loop that actually runs containers.
+
+- `internal/runtime`: a from-scratch Docker Engine API client speaking
+  HTTP/JSON over the `/var/run/docker.sock` Unix socket using only `net/http`
+  — no Docker SDK, still zero dependencies. Pull, create, start, stop, remove,
+  list, inspect; idempotent start/stop/remove.
+- `internal/spec`: declarative desired state (workloads = image + replicas +
+  command), loaded and validated from JSON.
+- `internal/agent`: the reconcile loop — stateless (the daemon is the source
+  of truth), idempotent, convergent (self-heals crashed replicas by restart),
+  and fault-tolerant (per-container failures don't abort the pass).
+- `cmd/nimbusd`: the node daemon — `run` (control loop with SIGHUP spec reload
+  and a graceful shutdown that leaves workloads up), `status`, `down`.
+
+### Simulation engine (the future "brain", retained)
 
 - Multi-tenant heterogeneous workloads: complementary pod shapes (balanced
   web, CPU-heavy api, memory-heavy cache) with per-workload SLO accounting,

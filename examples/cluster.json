@@ -1,0 +1,15 @@
+{
+  "workloads": [
+    {
+      "name": "web",
+      "image": "nginx:alpine",
+      "replicas": 2
+    },
+    {
+      "name": "worker",
+      "image": "busybox:latest",
+      "replicas": 3,
+      "cmd": ["sh", "-c", "while true; do echo working; sleep 5; done"]
+    }
+  ]
+}
