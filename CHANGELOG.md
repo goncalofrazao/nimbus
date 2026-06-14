@@ -30,6 +30,12 @@ healing reconcile loop that actually runs containers.
   Exec probes are namespace-local, so they work without container networking.
   New `runtime.Exec` (create/start/inspect over the Docker exec API).
 
+- Integration test suite (`test/integration`, build tag `integration`): real
+  end-to-end tests against a live Docker daemon — runtime lifecycle, exec,
+  reconcile converge + self-heal, scale-down, and liveness kill+restart. A new
+  CI job runs them on a Docker-equipped runner; `go test ./...` stays hermetic.
+  `make integration` runs them locally.
+
 ### Simulation engine (the future "brain", retained)
 
 - Multi-tenant heterogeneous workloads: complementary pod shapes (balanced
