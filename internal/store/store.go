@@ -94,6 +94,16 @@ func (s *Store) Spec() *spec.Spec {
 	return &spec.Spec{Workloads: out}
 }
 
+// State returns a consistent snapshot of the committed state — generation and
+// workloads taken under one lock, so they always correspond.
+func (s *Store) State() State {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]spec.Workload, len(s.st.Workloads))
+	copy(out, s.st.Workloads)
+	return State{Generation: s.st.Generation, Workloads: out}
+}
+
 // Generation returns the current committed generation.
 func (s *Store) Generation() int64 {
 	s.mu.RLock()
@@ -175,23 +185,25 @@ func (s *Store) Delete(name string) (existed bool, err error) {
 	return true, nil
 }
 
-// Scale sets a workload's replica count and commits.
-func (s *Store) Scale(name string, replicas int) error {
+// Scale sets a workload's replica count and commits. It reports whether the
+// workload existed — a missing workload is not an error, so callers (the CLI,
+// the HTTP API) decide how to surface it.
+func (s *Store) Scale(name string, replicas int) (existed bool, err error) {
 	if replicas < 0 {
-		return fmt.Errorf("negative replicas")
+		return false, fmt.Errorf("negative replicas")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	w, ok := s.getLocked(name)
 	if !ok {
-		return fmt.Errorf("no such workload %q", name)
+		return false, nil
 	}
 	if w.Replicas == replicas {
-		return nil
+		return true, nil
 	}
 	w.Replicas = replicas
-	_, err := s.upsertLocked(w)
-	return err
+	_, err = s.upsertLocked(w)
+	return true, err
 }
 
 // --- locked helpers -------------------------------------------------------

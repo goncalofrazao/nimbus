@@ -95,14 +95,26 @@ func TestDelete(t *testing.T) {
 func TestScale(t *testing.T) {
 	_, s := tmpStore(t)
 	s.Apply(wl("web", 1))
-	if err := s.Scale("web", 4); err != nil {
+	existed, err := s.Scale("web", 4)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !existed {
+		t.Fatal("scale of an existing workload should report existed")
 	}
 	if got, _ := s.Get("web"); got.Replicas != 4 {
 		t.Fatalf("replicas=%d want 4", got.Replicas)
 	}
-	if err := s.Scale("ghost", 1); err == nil {
-		t.Fatal("scaling a missing workload should error")
+	genBefore := s.Generation()
+	existed, err = s.Scale("ghost", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existed {
+		t.Fatal("scaling a missing workload should report existed=false")
+	}
+	if s.Generation() != genBefore {
+		t.Fatalf("scale of a missing workload must not bump generation: %d", s.Generation())
 	}
 }
 
