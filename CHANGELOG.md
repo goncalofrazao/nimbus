@@ -51,6 +51,17 @@ healing reconcile loop that actually runs containers.
   reconcile converge + self-heal, scale-down, and liveness kill+restart. A new
   CI job runs them on a Docker-equipped runner; `go test ./...` stays hermetic.
   `make integration` runs them locally.
+- Control-plane HTTP API (`internal/api`, story A1 of the control-plane/agent
+  split): `nimbusd serve` exposes the desired-state store over HTTP/JSON —
+  `POST/GET /v1/workloads`, `GET /v1/workloads/{name}`, scale, delete, and
+  `/healthz` — binding loopback by default (no auth yet). A stdlib HTTP client
+  (`api.Client`) backs the operator commands: `apply`/`get`/`scale`/`delete`
+  take `-server <url>` to talk to a running control plane instead of opening
+  the store file; without it they keep mutating the local store as before.
+  Requests are strictly validated (unknown fields rejected, atomic batch
+  apply, nothing half-commits). Handlers are unit-tested end-to-end through
+  the real client against `httptest`, including durability across a control-
+  plane restart.
 
 ### Simulation engine (the future "brain", retained)
 

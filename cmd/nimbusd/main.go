@@ -1,21 +1,24 @@
-// Command nimbusd is the Nimbus node daemon. It reconciles the containers on
-// this host toward a persistent, declared desired state.
+// Command nimbusd is Nimbus. One binary, several modes:
 //
+//	nimbusd serve  [-listen addr]       [-state f]            control plane (HTTP API)
 //	nimbusd run    [-spec cluster.json] [-state f] [-interval 5s] [-once]
-//	nimbusd apply  -spec cluster.json   [-state f]
-//	nimbusd scale  <workload> <n>       [-state f]
-//	nimbusd delete <workload>           [-state f]
-//	nimbusd get                         [-state f]
+//	nimbusd apply  -spec cluster.json   [-state f] [-server url]
+//	nimbusd scale  <workload> <n>       [-state f] [-server url]
+//	nimbusd delete <workload>           [-state f] [-server url]
+//	nimbusd get                         [-state f] [-server url]
 //	nimbusd status
 //	nimbusd down   [-spec cluster.json]
 //
-// Desired state lives in a durable store (a crash-safe JSON file). `apply`,
-// `scale` and `delete` mutate it; `run` is the control loop, reconciling from
-// the store and reloading it each pass so changes from those commands take
-// effect live. `run -spec` seeds the store from a file for convenience.
+// Desired state lives in a durable store (a crash-safe JSON file). `serve`
+// exposes it over the control-plane HTTP API; with `-server` the operator
+// commands (`apply`, `get`, `scale`, `delete`) talk to that API instead of
+// opening the store file directly, so they work from anywhere the control
+// plane is reachable. Without `-server` they mutate the local store, which
+// pairs with `run` — the all-in-one single-node mode, whose control loop
+// reloads the store each pass so changes take effect live.
 //
-// SIGINT/SIGTERM stop the loop cleanly and leave the containers running — like
-// a kubelet, the daemon going down must not take the workloads with it.
+// SIGINT/SIGTERM stop the daemons cleanly and leave the containers running —
+// like a kubelet, the daemon going down must not take the workloads with it.
 package main
 
 import (
@@ -23,6 +26,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -31,6 +35,7 @@ import (
 	"time"
 
 	"github.com/goncalofrazao/nimbus/internal/agent"
+	"github.com/goncalofrazao/nimbus/internal/api"
 	"github.com/goncalofrazao/nimbus/internal/runtime"
 	"github.com/goncalofrazao/nimbus/internal/spec"
 	"github.com/goncalofrazao/nimbus/internal/store"
@@ -50,6 +55,8 @@ func main() {
 
 	var err error
 	switch cmd {
+	case "serve":
+		err = serveCmd(log, args)
 	case "run":
 		err = runCmd(log, args)
 	case "apply":
@@ -78,22 +85,33 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `nimbusd — Nimbus node daemon
+	fmt.Fprint(os.Stderr, `nimbusd — Nimbus, a container orchestrator
 
 usage:
+  nimbusd serve  [-listen `+api.DefaultAddr+`] [-state <file>]   control plane: HTTP API over the store
   nimbusd run    [-spec <file>] [-state <file>] [-interval 5s] [-once]
-  nimbusd apply  -spec <file>   [-state <file>]   upsert workloads into the store
-  nimbusd scale  <workload> <n> [-state <file>]   set a workload's replica count
-  nimbusd delete <workload>     [-state <file>]   remove a workload
-  nimbusd get                   [-state <file>]   print desired state
-  nimbusd status                                  show managed containers
-  nimbusd down   [-spec <file>]                   stop & remove containers
+  nimbusd apply  -spec <file>   [-state <file>] [-server <url>]   upsert workloads
+  nimbusd scale  <workload> <n> [-state <file>] [-server <url>]   set a workload's replica count
+  nimbusd delete <workload>     [-state <file>] [-server <url>]   remove a workload
+  nimbusd get                   [-state <file>] [-server <url>]   print desired state
+  nimbusd status                                                  show managed containers
+  nimbusd down   [-spec <file>]                                   stop & remove containers
+
+Operator commands mutate the local -state file, or a running control plane
+when -server (e.g. -server http://`+api.DefaultAddr+`) is given.
 `)
 }
 
 // stateFlag registers and returns the shared -state flag.
 func stateFlag(fs *flag.FlagSet) *string {
 	return fs.String("state", defaultStatePath, "path to the persistent desired-state store")
+}
+
+// serverFlag registers and returns the shared -server flag. When set, an
+// operator command talks HTTP to the control plane instead of opening the
+// local store file.
+func serverFlag(fs *flag.FlagSet) *string {
+	return fs.String("server", "", "control-plane URL (e.g. http://"+api.DefaultAddr+"); empty = use the local -state file")
 }
 
 // parseArgs parses flags that may appear before, after, or between positional
@@ -124,6 +142,42 @@ func connect(ctx context.Context) (*runtime.Client, error) {
 		return nil, fmt.Errorf("cannot reach docker at %s: %w", runtime.DefaultSocket, err)
 	}
 	return rt, nil
+}
+
+// serveCmd runs the control plane: the HTTP API over the durable store. It
+// touches no containers — agents (and, for now, `run` daemons) do that.
+func serveCmd(log *slog.Logger, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	listen := fs.String("listen", api.DefaultAddr, "address to listen on (loopback by default; the API has no auth yet)")
+	statePath := stateFlag(fs)
+	fs.Parse(args)
+
+	st, err := store.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           api.NewServer(st, log),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+	log.Info("control plane listening", "addr", *listen, "state", *statePath,
+		"generation", st.Generation(), "workloads", len(st.Spec().Workloads))
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case err := <-errc:
+		return err // e.g. the listen address is taken
+	case sig := <-sigs:
+		log.Info("shutting down", "signal", sig.String())
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(ctx)
+	}
 }
 
 func runCmd(log *slog.Logger, args []string) error {
@@ -244,6 +298,7 @@ func applyCmd(args []string) error {
 	fs := flag.NewFlagSet("apply", flag.ExitOnError)
 	specPath := fs.String("spec", "", "path to the spec file to apply (JSON)")
 	statePath := stateFlag(fs)
+	server := serverFlag(fs)
 	fs.Parse(args)
 	if *specPath == "" {
 		return fmt.Errorf("apply: -spec is required")
@@ -252,22 +307,34 @@ func applyCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(*statePath)
-	if err != nil {
-		return err
-	}
-	n, err := st.ApplyAll(sp.Workloads)
-	if err != nil {
-		return err
+
+	var n int
+	var gen int64
+	if *server != "" {
+		res, err := api.NewClient(*server).Apply(context.Background(), sp.Workloads)
+		if err != nil {
+			return err
+		}
+		n, gen = res.Applied, res.Generation
+	} else {
+		st, err := store.Open(*statePath)
+		if err != nil {
+			return err
+		}
+		if n, err = st.ApplyAll(sp.Workloads); err != nil {
+			return err
+		}
+		gen = st.Generation()
 	}
 	fmt.Printf("applied %d workload(s) from %s (%d unchanged); generation %d\n",
-		n, *specPath, len(sp.Workloads)-n, st.Generation())
+		n, *specPath, len(sp.Workloads)-n, gen)
 	return nil
 }
 
 func scaleCmd(args []string) error {
 	fs := flag.NewFlagSet("scale", flag.ExitOnError)
 	statePath := stateFlag(fs)
+	server := serverFlag(fs)
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
@@ -280,20 +347,36 @@ func scaleCmd(args []string) error {
 	if err != nil {
 		return fmt.Errorf("replicas must be an integer: %q", pos[1])
 	}
-	st, err := store.Open(*statePath)
-	if err != nil {
-		return err
+
+	var gen int64
+	if *server != "" {
+		res, err := api.NewClient(*server).Scale(context.Background(), name, n)
+		if err != nil {
+			return err
+		}
+		gen = res.Generation
+	} else {
+		st, err := store.Open(*statePath)
+		if err != nil {
+			return err
+		}
+		existed, err := st.Scale(name, n)
+		if err != nil {
+			return err
+		}
+		if !existed {
+			return fmt.Errorf("no such workload %q", name)
+		}
+		gen = st.Generation()
 	}
-	if err := st.Scale(name, n); err != nil {
-		return err
-	}
-	fmt.Printf("scaled %s to %d; generation %d\n", name, n, st.Generation())
+	fmt.Printf("scaled %s to %d; generation %d\n", name, n, gen)
 	return nil
 }
 
 func deleteCmd(args []string) error {
 	fs := flag.NewFlagSet("delete", flag.ExitOnError)
 	statePath := stateFlag(fs)
+	server := serverFlag(fs)
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
@@ -302,38 +385,63 @@ func deleteCmd(args []string) error {
 		return fmt.Errorf("usage: nimbusd delete <workload>")
 	}
 	name := pos[0]
-	st, err := store.Open(*statePath)
-	if err != nil {
-		return err
-	}
-	existed, err := st.Delete(name)
-	if err != nil {
-		return err
+
+	var existed bool
+	var gen int64
+	if *server != "" {
+		res, err := api.NewClient(*server).Delete(context.Background(), name)
+		if err != nil {
+			return err
+		}
+		existed, gen = res.Existed, res.Generation
+	} else {
+		st, err := store.Open(*statePath)
+		if err != nil {
+			return err
+		}
+		if existed, err = st.Delete(name); err != nil {
+			return err
+		}
+		gen = st.Generation()
 	}
 	if !existed {
 		fmt.Printf("no such workload %q\n", name)
 		return nil
 	}
-	fmt.Printf("deleted %s; generation %d\n", name, st.Generation())
+	fmt.Printf("deleted %s; generation %d\n", name, gen)
 	return nil
 }
 
 func getCmd(args []string) error {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
 	statePath := stateFlag(fs)
+	server := serverFlag(fs)
 	fs.Parse(args)
-	st, err := store.Open(*statePath)
-	if err != nil {
-		return err
+
+	var gen int64
+	var ws []spec.Workload
+	if *server != "" {
+		st, err := api.NewClient(*server).State(context.Background())
+		if err != nil {
+			return err
+		}
+		gen, ws = st.Generation, st.Workloads
+	} else {
+		st, err := store.Open(*statePath)
+		if err != nil {
+			return err
+		}
+		snap := st.State()
+		gen, ws = snap.Generation, snap.Workloads
 	}
-	s := st.Spec()
-	fmt.Printf("desired state (generation %d):\n", st.Generation())
-	if len(s.Workloads) == 0 {
+
+	fmt.Printf("desired state (generation %d):\n", gen)
+	if len(ws) == 0 {
 		fmt.Println("  (empty)")
 		return nil
 	}
 	fmt.Printf("  %-16s %-24s %s\n", "WORKLOAD", "IMAGE", "REPLICAS")
-	for _, w := range s.Workloads {
+	for _, w := range ws {
 		live := ""
 		if w.Liveness != nil {
 			live = "  (liveness)"
